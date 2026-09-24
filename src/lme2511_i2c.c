@@ -339,6 +339,57 @@ int lme2511_ctrl_read(struct dvb_usb_device *d, u8 addr7, u8 reg, u8 *val)
 	return ret < 0 ? ret : 0;
 }
 
+/* EP0 读寄存器（app 0x1379a4, BER/alt 寄存器读取用的完整流程）:
+ * handshake + 写地址(0x40,bReq=3,wIndex=addr<<1,[reg],1) + ACK(0xC0,bReq=0,wIndex=5)
+ * + 读数据(0xC0,bReq=2,wIndex=addr<<1,&val,1) + ACK。
+ * 与 lme2511_ctrl_read(缺写地址)不同, 这是 app 读 0xc6/0xd0-d7 的流程。 */
+/* EP0 读寄存器（app 0x1379a4 流程, 但注意: app 实际走 EP1 bulk 8字节头
+ * 命令而非 EP0 control, 本 EP0 版本 handshake 会超时 -110, 已弃用）。
+ * 正确实现见 lgs8gl5_read_ber 注释。 */
+int lme2511_ctrl_read_reg(struct dvb_usb_device *d, u8 addr7, u8 reg, u8 *val)
+{
+	u8 ack;
+	int ret;
+
+	ret = lme2511_ctrl_handshake(d);
+	if (ret < 0)
+		return ret;
+
+	/* 写寄存器地址 (1 字节) */
+	ret = lme2511_ctrl_xfer(d, 0x40, 0x03, 0, (u16)(addr7 << 1), &reg, 1);
+	if (ret < 0)
+		return ret;
+
+	/* ACK */
+	ack = 0xff;
+	ret = lme2511_ctrl_xfer(d, 0xC0, 0x00, 0, 5, &ack, 1);
+	if (ret < 0)
+		return ret;
+
+	/* 读数据 (1 字节) */
+	ret = lme2511_ctrl_xfer(d, 0xC0, 0x02, 0, (u16)(addr7 << 1), val, 1);
+	if (ret < 0)
+		return ret;
+
+	/* ACK */
+	ack = 0xff;
+	ret = lme2511_ctrl_xfer(d, 0xC0, 0x00, 0, 5, &ack, 1);
+	return ret < 0 ? ret : 0;
+}
+
+/* EP0 写寄存器 (app 0x137b34 0xc6 锁存: 0x40,bReq=2,wIndex=addr<<1,[reg,val],2) */
+int lme2511_ctrl_write_reg(struct dvb_usb_device *d, u8 addr7, u8 reg, u8 val)
+{
+	u8 buf[2] = { reg, val };
+	int ret;
+
+	ret = lme2511_ctrl_handshake(d);
+	if (ret < 0)
+		return ret;
+	ret = lme2511_ctrl_xfer(d, 0x40, 0x02, 0, (u16)(addr7 << 1), buf, 2);
+	return ret < 0 ? ret : 0;
+}
+
 static u32 lme2511_i2c_func(struct i2c_adapter *adapter)
 {
 	return I2C_FUNC_I2C;

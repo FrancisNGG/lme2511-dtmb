@@ -173,16 +173,9 @@ int lme2511_read_snr(struct dvb_frontend *fe, u16 *snr)
  */
 int lme2511_status_init(struct dvb_usb_adapter *adap)
 {
-	int ret = lme2511_int_start(adap);
-	if (ret < 0)
-		return ret;
-
-	/* Override frontend ops: EP8A for signal/SNR, keep I2C for lock */
-	if (adap->fe[0]) {
-		adap->fe[0]->ops.read_signal_strength =
-			lme2511_read_signal_strength;
-		adap->fe[0]->ops.read_snr = lme2511_read_snr;
-	}
-
-	return 0;
+	/* 只启动 EP8A interrupt URB(对齐 app: 固件每 ~512ms 主动上报
+	 * bb05 状态包, 供逆向核对/调试)。
+	 * 信号强度/SNR/BER 走 lgs8gl5 的 I2C 读取(0x4b / 0x95 / 0xd0-d7),
+	 * 此处不 override —— app 反汇编实测信号来源是 I2C 而非 EP8A。 */
+	return lme2511_int_start(adap);
 }

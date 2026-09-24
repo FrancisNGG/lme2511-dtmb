@@ -88,6 +88,12 @@ struct lme2511_state {
 	 * while streaming (I2C forbidden, EP8A carries no 0x4B). */
 	u16 cached_signal_4b;
 
+	/* 0x95 C/N (REG_AVG_NOISE <<8), cached while streaming. */
+	u16 cached_snr;
+
+	/* BER (errors/total, ppm) cached while streaming (I2C forbidden). */
+	u32 cached_ber;
+
 	/* MAX2165 ROM calibration table (read at init) */
 	u8 rom_tf_ntch_hi;       /* rom[1] & 0x0F, freq >= 725 MHz */
 	u8 rom_tf_ntch_low;      /* rom[1] >> 4,  freq <  725 MHz */
@@ -131,6 +137,9 @@ int lme2511_i2c_demod_sync(struct dvb_usb_device *d);
 /* Control-transfer I2C (app 锁定流程走 vendor control transfer, 非 bulk 桥消息) */
 int lme2511_ctrl_write(struct dvb_usb_device *d, u8 addr7, u8 reg, u8 val);
 int lme2511_ctrl_read(struct dvb_usb_device *d, u8 addr7, u8 reg, u8 *val);
+/* 完整 EP0 vendor 读写 (app 0x1379a4/0x137b34, 含写地址步骤, 读 alt 寄存器用) */
+int lme2511_ctrl_read_reg(struct dvb_usb_device *d, u8 addr7, u8 reg, u8 *val);
+int lme2511_ctrl_write_reg(struct dvb_usb_device *d, u8 addr7, u8 reg, u8 val);
 
 /* MCU */
 int lme2511_mcu_cmd(struct dvb_usb_device *d, u8 *buf, u8 len);

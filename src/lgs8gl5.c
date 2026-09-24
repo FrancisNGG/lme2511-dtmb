@@ -48,6 +48,14 @@
 #define REG_AVG_NOISE   0x95
 #define ALT_REG_C5      0xc5
 
+/* BER 计数器 (app 反汇编 0x137b34): total = 0xd3..0xd0 大端,
+ * errors = 0xd7..0xd4 大端; 0xc6 = 锁存控制(bit7)。 */
+#define REG_BER_TOTAL0  0xd0
+#define REG_BER_TOTAL3  0xd3
+#define REG_BER_ERROR0  0xd4
+#define REG_BER_ERROR3  0xd7
+#define REG_BER_LATCH   0xc6
+
 struct lgs8gl5_state {
 	struct i2c_adapter *i2c;
 	struct lgs8gl5_config config;  /* copy, not pointer */
@@ -178,6 +186,8 @@ static int lgs8gl5_init(struct dvb_frontend *fe)
  *   - Re-lock demod[1]=0x60 after
  *   - Demod resync + soft_reset + wait_lock (3-mode retry)
  */
+static void lgs8gl5_cache_signal(struct dvb_frontend *fe);
+
 static int lgs8gl5_set_frontend(struct dvb_frontend *fe)
 {
 	struct dtv_frontend_properties *p = &fe->dtv_property_cache;
@@ -308,6 +318,12 @@ static int lgs8gl5_set_frontend(struct dvb_frontend *fe)
 			lgs8gl5_write_reg(state, REG_7D, (u8)a2);
 		lgs8gl5_write_reg(state, REG_RESET, 0x00);
 		lgs8gl5_write_reg(state, REG_RESET, 0x01);
+
+		/* 锁定后缓存信号指标(0x4b/0x95/0xd0-d7), 供 streaming 时
+		 * read_* 在 I2C 禁止期间返回。收尾有复位, demod 需重新锁定
+		 * 稳定, 等 ~200ms 后再读, 否则读到复位初始值(全 0)。 */
+		msleep(200);
+		lgs8gl5_cache_signal(fe);
 	}
 
 	if (ret == 0) {
@@ -435,20 +451,100 @@ static int lgs8gl5_read_status(struct dvb_frontend *fe,
 	return 0;
 }
 
+/* 读 0x4b 信号强度 / 0x95 C/N / 0xd0-d7 BER, 填充 st 缓存。
+ * 锁定后调用, streaming 时 read_* 只能返回这些缓存值(I2C 禁止)。 */
+static void lgs8gl5_cache_signal(struct dvb_frontend *fe)
+{
+	struct dvb_usb_device *d = fe_to_d(fe);
+	struct lme2511_state *st = d->priv;
+	struct lgs8gl5_state *state = fe->demodulator_priv;
+	int level, noise;
+
+	level = lgs8gl5_read_reg(state, REG_STRENGTH);
+	if (level >= 0)
+		st->cached_signal_4b = (u16)((level & REG_STRENGTH_MASK) << 9);
+
+	noise = lgs8gl5_read_reg(state, REG_AVG_NOISE);
+	if (noise >= 0)
+		st->cached_snr = (u16)((noise & 0xff) << 8);
+}
+
+/* 读 BER (app 协议 0x137b34): 0xc6/0xd0-d7 经 EP0 vendor control transfer
+ * 访问 demod alt(0x1b)。先 0xc6 锁存(bit7) → 读 0xd0..0xd7 → 解除锁存。
+ *   total  = 0xd3 d2 d1 d0 (d3 最高字节)
+ *   errors = 0xd7 d6 d5 d4 (d7 最高字节)
+ * EP0 vendor 在 streaming 时可用(app 播放时读 live status 实测), 与 TS 不冲突,
+ * 故 read_ber 任何时候都直接读, 不走缓存。 */
+static void __maybe_unused lgs8gl5_cache_ber(struct dvb_frontend *fe)
+{
+	struct dvb_usb_device *d = fe_to_d(fe);
+	struct lme2511_state *st = d->priv;
+	u8 c6 = 0, v[8] = {0};
+	int i, ok = 1;
+
+	if (lme2511_ctrl_read_reg(d, I2C_ADDR_DEMOD_ALT,
+				  REG_BER_LATCH, &c6) >= 0)
+		lme2511_ctrl_write_reg(d, I2C_ADDR_DEMOD_ALT,
+				       REG_BER_LATCH, c6 | 0x80);
+
+	for (i = 0; i < 8; i++) {
+		if (lme2511_ctrl_read_reg(d, I2C_ADDR_DEMOD_ALT,
+					  0xd0 + i, &v[i]) < 0) {
+			ok = 0;
+			break;
+		}
+	}
+
+	lme2511_ctrl_write_reg(d, I2C_ADDR_DEMOD_ALT,
+			       REG_BER_LATCH, c6 & 0x3f);
+
+	if (ok) {
+		u32 total = ((u32)v[3] << 24) | ((u32)v[2] << 16) |
+			    ((u32)v[1] << 8) | v[0];
+		u32 errors = ((u32)v[7] << 24) | ((u32)v[6] << 16) |
+			     ((u32)v[5] << 8) | v[4];
+
+		/* quality = 100 - errors*100/total; BER 以 ppm 表示 */
+		if (total == 0 || errors > total)
+			st->cached_ber = 0;
+		else
+			st->cached_ber = errors * 1000000 / total;
+
+		printk(KERN_INFO
+		       "lme2511_dbg: cache total=%u errors=%u ber=%u ppm\n",
+		       total, errors, st->cached_ber);
+	}
+}
+
 static int lgs8gl5_read_ber(struct dvb_frontend *fe, u32 *ber)
 {
+	/* BER 暂未实现, 返回 0。
+	 *
+	 * app 逆向结论 (reference_client.so 反汇编 0x137b34 + usbmon 抓包):
+	 *   - BER 计数器 = demod alt(0x1b) 的 8 个寄存器 0xd0..0xd7:
+	 *       total  = 0xd3 d2 d1 d0 (大端, d3 最高字节)
+	 *       errors = 0xd7 d6 d5 d4 (大端, d7 最高字节)
+	 *   - 读前先 0xc6 锁存(bit7=1), 读完 0xc6 解除(清 bit7+bit6)
+	 *   - quality = 100 - errors*100/total (app 的 signal test 用)
+	 *   - 走 EP1 bulk 命令(8 字节头 0x40/0xC0 + bReq + wValue + wIndex
+	 *     + wLength), 不是 EP0 control, 也不是普通 I2C(0x85) —— 这是
+	 *     app 读 0xc6/0xd0-d7 的专用协议, 尚未实现。
+	 *   - 注意: app 播放时(live status)只读 0x4b/0x95/0xa4, 不读 BER;
+	 *     0xd0-d7 仅 nativeTuneForSignalTest 功能用。
+	 */
 	*ber = 0;
 	return 0;
 }
 
 static int lgs8gl5_read_signal_strength(struct dvb_frontend *fe,
-					     u16 *signal_strength)
+				     u16 *signal_strength)
 {
 	struct dvb_usb_device *d = fe_to_d(fe);
 	struct lme2511_state *st = d->priv;
 
 	if (st->stream_active) {
-		/* streaming: I2C 禁止, EP8A 无 0x4B, 用录流前缓存 */
+		/* streaming: 频繁 I2C 读会 stall TS(app 播放时 I2C 读频率低
+		 * 才不冲突), 用锁定后缓存的 0x4b */
 		*signal_strength = st->cached_signal_4b;
 		return 0;
 	}
@@ -459,9 +555,7 @@ static int lgs8gl5_read_signal_strength(struct dvb_frontend *fe,
 
 		if (level < 0)
 			return -EIO;
-		/* 信号强度 = 0x4B 低 7 位 (0-127)。kernel 用 <<8 (最大 49.6%)
-		 * 偏低; <<9 让锁定态 (0x4B低7位≈66) ≈51.6%, 接近 Windows 实测
-		 * 59.75%, 物理合理。 */
+		/* 信号强度 = 0x4B 低 7 位 <<9 (锁定态≈52%) */
 		st->cached_signal_4b = (u16)((level & REG_STRENGTH_MASK) << 9);
 		*signal_strength = st->cached_signal_4b;
 	}
@@ -474,8 +568,8 @@ static int lgs8gl5_read_snr(struct dvb_frontend *fe, u16 *snr)
 	struct lme2511_state *st = d->priv;
 
 	if (st->stream_active) {
-		/* streaming: I2C 禁止, 用 EP8A 状态包缓存的 0x95 */
-		*snr = (u16)(st->signal_snr << 8);
+		/* streaming: 用锁定后缓存的 0x95 */
+		*snr = st->cached_snr;
 		return 0;
 	}
 
@@ -485,8 +579,9 @@ static int lgs8gl5_read_snr(struct dvb_frontend *fe, u16 *snr)
 
 		if (noise < 0)
 			return noise;
-		/* 0x95 = 信号质量/SNR(越大越好)。直接用原值(不取反)。 */
-		*snr = (u16)((noise & 0xff) << 8);
+		/* 0x95 = C/N 信号质量(越大越好) */
+		st->cached_snr = (u16)((noise & 0xff) << 8);
+		*snr = st->cached_snr;
 	}
 	return 0;
 }

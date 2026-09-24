@@ -37,6 +37,23 @@ int lme2511_power_ctrl(struct dvb_usb_device *d, int onoff)
 		int ret = usb_set_interface(d->udev,
 					 d->props->bInterfaceNumber, 1);
 		msleep(200);
+
+		/* 0x8a interrupt 端点仅存在于 alt-setting 1。usb_set_interface
+		 * 会 disable+enable 端点, 挂起的 EP8A URB 收到 -ESHUTDOWN 即停,
+		 * 因此每次切到 alt-setting 1 之后必须重启 EP8A(kill 旧 URB 再
+		 * 重新提交), 不能靠 int_urb 判空跳过——否则第二次 power_ctrl(1)
+		 * 会把 EP8A 杀死。 */
+		if (ret == 0) {
+			struct lme2511_state *st = d->priv;
+
+			if (st->int_urb) {
+				usb_kill_urb(st->int_urb);
+				usb_free_urb(st->int_urb);
+				st->int_urb = NULL;
+			}
+			lme2511_status_init(&d->adapter[0]);
+		}
+
 		return ret;
 	}
 	return 0;
@@ -203,17 +220,8 @@ int lme2511_frontend_attach(struct dvb_usb_adapter *adap)
 	 *     The framework's dvb_usb_fe_init wrapper calls power_ctrl(1)
 	 *     then our lgs8gl5_init — no need to call it here. */
 
-	/* 11. EP8A interrupt URB disabled — MCU conflicts with TS streaming.
-	 *     实验确认: 启用后中断端点每 ~512ms 返回 8B 状态, 但 FEC(0xa4)
-	 *     仍恒 0x00 不锁 → 中断端点只是状态上报通道, 不影响锁定, 回退禁用 */
-#if 0
-	ret = lme2511_status_init(adap);
-	if (ret < 0) {
-		dev_err(&d->udev->dev, "EP8A interrupt init failed: %d\n",
-			ret);
-		goto demod_fail;
-	}
-#endif
+	/* 11. EP8A interrupt URB 改由 power_ctrl(1) 在切到 alt-setting 1
+	 *     之后启动(0x8a 端点仅存在于 alt-setting 1)。此处不启动。 */
 
 	dev_info(&d->udev->dev, "LME2511 DTMB frontend ready\n");
 	return 0;

@@ -319,10 +319,11 @@ static int lgs8gl5_set_frontend(struct dvb_frontend *fe)
 		lgs8gl5_write_reg(state, REG_RESET, 0x00);
 		lgs8gl5_write_reg(state, REG_RESET, 0x01);
 
-		/* 锁定后缓存信号指标(0x4b/0x95/0xd0-d7), 供 streaming 时
-		 * read_* 在 I2C 禁止期间返回。收尾有复位, demod 需重新锁定
-		 * 稳定, 等 ~200ms 后再读, 否则读到复位初始值(全 0)。 */
-		msleep(200);
+		/* 锁定后缓存信号指标(0x4b/0x95), 供 streaming 时 read_* 在 I2C
+		 * 禁止期间返回。收尾有复位, demod 需重新锁定稳定; 弱台(586)AGC
+		 * 收敛慢, 连续调谐场景实测 200ms 不够(偶发读到未收敛的虚假高值
+		 * 76% 或复位全 0), 加长到 500ms。 */
+		msleep(500);
 		lgs8gl5_cache_signal(fe);
 	}
 
@@ -459,21 +460,22 @@ static void lgs8gl5_cache_signal(struct dvb_frontend *fe)
 	struct lme2511_state *st = d->priv;
 	struct lgs8gl5_state *state = fe->demodulator_priv;
 	int level, noise;
-	int samples[5];
+	int samples[9];
 	int i, j, k, tmp, r;
 
 	level = lgs8gl5_read_reg(state, REG_STRENGTH);
 	if (level >= 0)
 		st->cached_signal_4b = (u16)((level & REG_STRENGTH_MASK) << 9);
 
-	/* 0x95 是瞬时 AGC 噪声, 单次波动大(弱台实测 ±16%)。采样 5 次取中位数。 */
-	for (i = 0; i < 5; i++) {
+	/* 0x95 是瞬时 AGC 噪声, 单次波动大(弱台实测 ±16%, 临界台可跳 0~77%)。
+	 * 采样 9 次 × 50ms = 400ms 跨度取中位数, 覆盖 AGC 收敛过程。 */
+	for (i = 0; i < 9; i++) {
 		r = lgs8gl5_read_reg(state, REG_AVG_NOISE);
 		if (r < 0)
 			break;
 		samples[i] = r & 0xff;
-		if (i < 4)
-			msleep(20);
+		if (i < 8)
+			msleep(50);
 	}
 	if (i > 0) {
 		for (j = 0; j < i - 1; j++)

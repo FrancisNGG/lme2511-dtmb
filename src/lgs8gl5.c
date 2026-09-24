@@ -451,7 +451,7 @@ static int lgs8gl5_read_status(struct dvb_frontend *fe,
 	return 0;
 }
 
-/* 读 0x4b 信号强度 / 0x95 C/N / 0xd0-d7 BER, 填充 st 缓存。
+/* 读 0x4b 信号强度 / 0x95 C/N, 填充 st 缓存。
  * 锁定后调用, streaming 时 read_* 只能返回这些缓存值(I2C 禁止)。 */
 static void lgs8gl5_cache_signal(struct dvb_frontend *fe)
 {
@@ -459,14 +459,33 @@ static void lgs8gl5_cache_signal(struct dvb_frontend *fe)
 	struct lme2511_state *st = d->priv;
 	struct lgs8gl5_state *state = fe->demodulator_priv;
 	int level, noise;
+	int samples[5];
+	int i, j, k, tmp, r;
 
 	level = lgs8gl5_read_reg(state, REG_STRENGTH);
 	if (level >= 0)
 		st->cached_signal_4b = (u16)((level & REG_STRENGTH_MASK) << 9);
 
-	noise = lgs8gl5_read_reg(state, REG_AVG_NOISE);
-	if (noise >= 0)
-		st->cached_snr = (u16)((noise & 0xff) << 8);
+	/* 0x95 是瞬时 AGC 噪声, 单次波动大(弱台实测 ±16%)。采样 5 次取中位数。 */
+	for (i = 0; i < 5; i++) {
+		r = lgs8gl5_read_reg(state, REG_AVG_NOISE);
+		if (r < 0)
+			break;
+		samples[i] = r & 0xff;
+		if (i < 4)
+			msleep(20);
+	}
+	if (i > 0) {
+		for (j = 0; j < i - 1; j++)
+			for (k = j + 1; k < i; k++)
+				if (samples[k] < samples[j]) {
+					tmp = samples[j];
+					samples[j] = samples[k];
+					samples[k] = tmp;
+				}
+		noise = samples[i / 2];  /* 中位数 */
+		st->cached_snr = (u16)(noise << 8);
+	}
 }
 
 /* 读 BER (app 协议 0x137b34): 0xc6/0xd0-d7 经 EP0 vendor control transfer

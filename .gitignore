@@ -1,0 +1,12 @@
+# 编译产物
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+.*.cmd
+modules.order
+Module.symvers
+
+# 固件 blob（rom.dat + fw_new.bin 拼接的生成物）
+dvb-usb-*.fw

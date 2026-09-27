@@ -316,6 +316,8 @@ struct dvb_frontend *max2165_attach(struct dvb_frontend *fe,
 	/* Register only set_params — init and ROM read are handled
 	 * separately during frontend_attach via max2165_init_tuner() */
 	fe->ops.tuner_ops.set_params = max2165_set_params;
+	/* 不设 tuner_ops.release: 会触发 dvb_detach→symbol_put_addr 下溢同模块
+	 * refcnt。tuner_priv 由 props->frontend_detach 释放。 */
 	fe->tuner_priv = priv;
 
 	printk(KERN_INFO "max2165: MAX2165 tuner attached\n");

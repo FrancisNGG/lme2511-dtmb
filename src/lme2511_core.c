@@ -59,10 +59,12 @@ int lme2511_power_ctrl(struct dvb_usb_device *d, int onoff)
 	return 0;
 }
 
-/* 释放 demod/tuner 私有内存。必须在 dvb_frontend_detach() 之前调用，
- * 因为 detach 会 free fe 容器（fe->demodulator_priv/tuner_priv 变成悬空）。
- * 原 .release 回调因 dvb_detach→symbol_put_addr 会下溢模块 refcnt 已移除，
- * 改在此处显式释放。 */
+/* 释放 demod/tuner 私有内存。由 lme2511_frontend_detach 调用。
+ * 不能放到 .release / tuner_ops.release 回调: 那会触发 dvb_detach→symbol_put_addr
+ * 下溢同模块 refcnt(module_put 触发 BUG_ON(refcnt<=0) 崩溃, 2026-09-27 拔棒 oops 实录)。
+ * 也不能在 exit(disconnect 第一步, frontend 线程未停)释放 → use-after-free。
+ * 正确时机是 props->frontend_detach, 框架在 dvb_unregister_frontend(停线程)
+ * + dvb_frontend_detach(释放 fepriv) 之后才调用它。 */
 static void lme2511_frontend_free_state(struct dvb_frontend *fe)
 {
 	if (!fe)
@@ -75,6 +77,19 @@ static void lme2511_frontend_free_state(struct dvb_frontend *fe)
 		kfree(fe->tuner_priv);
 		fe->tuner_priv = NULL;
 	}
+}
+
+/* ── Frontend detach ─────────────────────────────────────────────
+ * dvb_usbv2_adapter_frontend_exit 在 dvb_frontend_detach 之后调用
+ * props->frontend_detach。此时 frontend 线程已停、fepriv 已释放,
+ * fe 容器(state 内嵌) 与 demod/tuner 私有内存仍有效, 可安全释放。 */
+static int lme2511_frontend_detach(struct dvb_usb_adapter *adap)
+{
+	if (adap->fe[0]) {
+		lme2511_frontend_free_state(adap->fe[0]);
+		adap->fe[0] = NULL;
+	}
+	return 0;
 }
 
 /* ── Frontend attach ───────────────────────────────────────────── */
@@ -306,7 +321,6 @@ int lme2511_get_stream_config(struct dvb_frontend *fe, u8 *ts_type,
 void lme2511_exit(struct dvb_usb_device *d)
 {
 	struct lme2511_state *st = d->priv;
-	int i, j;
 
 	if (!st)
 		return;
@@ -318,11 +332,9 @@ void lme2511_exit(struct dvb_usb_device *d)
 		dev_dbg(&d->udev->dev, "EP8A interrupt URB stopped\n");
 	}
 
-	/* 释放 demod/tuner 私有内存（原 .release 职责）。
-	 * d->props->exit 在 dvb_usbv2_exit(detach fe) 之前调用，fe 仍有效。 */
-	for (i = 0; i < MAX_NO_OF_ADAPTER_PER_DEVICE; i++)
-		for (j = 0; j < MAX_NO_OF_FE_PER_ADAP; j++)
-			lme2511_frontend_free_state(d->adapter[i].fe[j]);
+	/* demod/tuner 私有内存改由 props->frontend_detach 回调释放
+	 * (dvb_frontend_detach 之后、frontend 线程已停止)。此处不再释放:
+	 * 若在 exit(disconnect 第一步, 线程未停)释放会 use-after-free(2026-09-27 实录)。 */
 }
 
 /* ── dvb_usb_device_properties ─────────────────────────────────── */
@@ -346,6 +358,7 @@ static struct dvb_usb_device_properties lme2511_props = {
 	.i2c_algo           = &lme2511_i2c_algo,
 
 	.frontend_attach    = lme2511_frontend_attach,
+	.frontend_detach    = lme2511_frontend_detach,
 	.tuner_attach       = NULL,   /* done in frontend_attach */
 
 	.streaming_ctrl     = lme2511_streaming_ctrl,

@@ -696,7 +696,8 @@ static const struct dvb_frontend_ops lgs8gl5_ops = {
 			FE_CAN_RECOVER
 	},
 
-	.release = NULL,   /* 不设 release: 避免 dvb_detach→symbol_put_addr 下溢模块 refcnt */
+	.release = NULL,  /* 不用 .release 释放 demod: 会触发 dvb_detach→symbol_put_addr
+			   * 下溢同模块 refcnt。改由 props->frontend_detach 释放。 */
 
 	.init = lgs8gl5_init,
 

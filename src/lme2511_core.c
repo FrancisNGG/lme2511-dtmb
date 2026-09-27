@@ -248,8 +248,19 @@ int lme2511_i2c_gate_ctrl(struct dvb_frontend *fe, int enable)
 
 int lme2511_streaming_ctrl(struct dvb_frontend *fe, int onoff)
 {
-	struct dvb_usb_device *d = fe_to_d(fe);
-	struct lme2511_state *st = d->priv;
+	struct dvb_usb_device *d;
+	struct lme2511_state *st;
+
+	/* 防御 use-after-free: fe 被 detach 后 fe->dvb 清为 NULL, 但
+	 * dvb_demux_release -> dvb_usb_stop_feed 仍会回调本函数, fe_to_d(fe)
+	 * 里 (fe)->dvb->priv 解引用空指针 → 内核 oops + 死锁(2026-09-27 实录,
+	 * SIGKILL 强杀 zap 进程触发)。无效则静默返回, 交由框架清理。 */
+	if (!fe || !fe->dvb)
+		return 0;
+	d = fe_to_d(fe);
+	st = d->priv;
+	if (!st)
+		return 0;
 
 	if (onoff) {
 		struct dvb_usb_adapter *adap = fe_to_adap(fe);
